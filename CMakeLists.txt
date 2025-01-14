@@ -1,20 +1,12 @@
-cmake_minimum_required(VERSION 3.0.2)
+cmake_minimum_required(VERSION 3.14.0)
 project(ur_client_library)
-
-set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/" ${CMAKE_MODULE_PATH})
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   message("${PROJECT_NAME}: You did not request a specific build type: selecting 'RelWithDebInfo'.")
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-
-##
-## Check C++11 support / enable global pedantic and Wall
-##
-include(DefineCXX17CompilerFlag)
-DEFINE_CXX_17_COMPILER_FLAG(CXX17_FLAG)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -pedantic")
+option(WITH_ASAN "Compile with address sanitizer support" OFF)
 
 add_library(urcl SHARED
     src/comm/tcp_socket.cpp
@@ -22,6 +14,7 @@ add_library(urcl SHARED
     src/control/reverse_interface.cpp
     src/control/script_sender.cpp
     src/control/trajectory_point_interface.cpp
+    src/control/script_command_interface.cpp
     src/primary/primary_package.cpp
     src/primary/robot_message.cpp
     src/primary/robot_state.cpp
@@ -41,13 +34,20 @@ add_library(urcl SHARED
     src/ur/calibration_checker.cpp
     src/ur/dashboard_client.cpp
     src/ur/tool_communication.cpp
+    src/ur/robot_receive_timeout.cpp
+    src/ur/version_information.cpp
     src/rtde/rtde_writer.cpp
     src/default_log_handler.cpp
     src/log.cpp
+    src/helpers.cpp
 )
 add_library(ur_client_library::urcl ALIAS urcl)
 target_compile_options(urcl PRIVATE -Wall -Wextra -Wno-unused-parameter)
-target_compile_options(urcl PUBLIC ${CXX17_FLAG})
+target_compile_features(urcl PUBLIC cxx_std_17)
+if(WITH_ASAN)
+  target_compile_options(urcl PUBLIC -fsanitize=address)
+  target_link_options(urcl PUBLIC -fsanitize=address)
+endif()
 target_include_directories( urcl PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -86,6 +86,16 @@ install(EXPORT urcl_targets
   FILE urclTargets.cmake
   NAMESPACE ur_client_library::)
 
+if(CATKIN_PACKAGE_BIN_DESTINATION)
+  install(PROGRAMS scripts/start_ursim.sh
+    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+  )
+else()
+  install(PROGRAMS scripts/start_ursim.sh
+    DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
+
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/ur_client_libraryConfigVersion.cmake VERSION 0.0.3
   COMPATIBILITY SameMajorVersion)
@@ -99,7 +109,7 @@ install(FILES package.xml DESTINATION share/${PROJECT_NAME})
 
 #### Begin import ####
 # Imported from ros-industrial/ros_industrial_cmake_boilerplate
-# https://github.com/ros-industrial/ros_industrial_cmake_boilerplate/blob/master/ros_industrial_cmake_boilerplate/cmake/cmake_tools.cmake
+# https://github.com/ros-industrial/ros_industrial_cmake_boilerplate/blob/59b86df662/ros_industrial_cmake_boilerplate/cmake/cmake_tools.cmake
 # Copyright (C) 2018 by George Cave - gcave@stablecoder.ca
 # Copyright (c) 2020, Southwest Research Institute
 # Licensed under Apache-2.0 license

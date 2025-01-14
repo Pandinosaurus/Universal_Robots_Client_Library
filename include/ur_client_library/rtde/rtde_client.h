@@ -29,6 +29,8 @@
 #ifndef UR_CLIENT_LIBRARY_RTDE_CLIENT_H_INCLUDED
 #define UR_CLIENT_LIBRARY_RTDE_CLIENT_H_INCLUDED
 
+#include <memory>
+
 #include "ur_client_library/comm/pipeline.h"
 #include "ur_client_library/rtde/package_header.h"
 #include "ur_client_library/rtde/rtde_package.h"
@@ -51,6 +53,7 @@ namespace rtde_interface
 {
 static const uint16_t MAX_RTDE_PROTOCOL_VERSION = 2;
 static const unsigned MAX_REQUEST_RETRIES = 5;
+static const unsigned MAX_INITIALIZE_ATTEMPTS = 10;
 
 enum class UrRtdeRobotStatusBits
 {
@@ -75,6 +78,15 @@ enum class UrRtdeSafetyStatusBits
   IS_STOPPED_DUE_TO_SAFETY = 10
 };
 
+enum class ClientState
+{
+  UNINITIALIZED = 0,
+  INITIALIZING = 1,
+  INITIALIZED = 2,
+  RUNNING = 3,
+  PAUSED = 4
+};
+
 /*!
  * \brief The RTDEClient class manages communication over the RTDE interface. It contains the RTDE
  * handshake and read and write functionality to and from the robot.
@@ -92,23 +104,53 @@ public:
    * \param output_recipe_file Path to the file containing the output recipe
    * \param input_recipe_file Path to the file containing the input recipe
    * \param target_frequency Frequency to run at. Defaults to 0.0 which means maximum frequency.
+   * \param ignore_unavailable_outputs Configure the behaviour when a variable of the output recipe is not available
+   * from the robot: output is silently ignored if true, a UrException is raised otherwise.
    */
   RTDEClient(std::string robot_ip, comm::INotifier& notifier, const std::string& output_recipe_file,
-             const std::string& input_recipe_file, double target_frequency = 0.0);
+             const std::string& input_recipe_file, double target_frequency = 0.0,
+             bool ignore_unavailable_outputs = false);
+
+  /*!
+   * \brief Creates a new RTDEClient object, including a used URStream and Pipeline to handle the
+   * communication with the robot.
+   *
+   * \param robot_ip The IP of the robot
+   * \param notifier The notifier to use in the pipeline
+   * \param output_recipe Vector containing the output recipe
+   * \param input_recipe Vector containing the input recipe
+   * \param target_frequency Frequency to run at. Defaults to 0.0 which means maximum frequency.
+   * \param ignore_unavailable_outputs Configure the behaviour when a variable of the output recipe is not available
+   * from the robot: output is silently ignored if true, a UrException is raised otherwise.
+   */
+  RTDEClient(std::string robot_ip, comm::INotifier& notifier, const std::vector<std::string>& output_recipe,
+             const std::vector<std::string>& input_recipe, double target_frequency = 0.0,
+             bool ignore_unavailable_outputs = false);
   ~RTDEClient();
   /*!
    * \brief Sets up RTDE communication with the robot. The handshake includes negotiation of the
    * used protocol version and setting of input and output recipes.
    *
+   * \param max_num_tries Maximum number of connection attempts before counting the connection as
+   * failed. Unlimited number of attempts when set to 0.
+   * \param reconnection_time time in between connection attempts to the server
+   *
    * \returns Success of the handshake
    */
-  bool init();
+  bool init(const size_t max_num_tries = 0,
+            const std::chrono::milliseconds reconnection_time = std::chrono::seconds(10));
   /*!
    * \brief Triggers the robot to start sending RTDE data packages in the negotiated format.
    *
    * \returns Success of the requested start
    */
   bool start();
+  /*!
+   * \brief Pauses RTDE data package communication
+   *
+   * \returns Whether the RTDE data package communication was paused successfully
+   */
+  bool pause();
   /*!
    * \brief Reads the pipeline to fetch the next data package.
    *
@@ -119,13 +161,23 @@ public:
   std::unique_ptr<rtde_interface::DataPackage> getDataPackage(std::chrono::milliseconds timeout);
 
   /*!
-   * \brief Getter for the frequency the robot will publish RTDE data packages with.
+   * \brief Getter for the maximum frequency the robot can publish RTDE data packages with.
    *
-   * \returns The used frequency
+   * \returns The maximum frequency
    */
   double getMaxFrequency() const
   {
     return max_frequency_;
+  }
+
+  /*!
+   * \brief Getter for the target frequency that the robot will publish RTDE data packages with.
+   *
+   * \returns The target frequency
+   */
+  double getTargetFrequency() const
+  {
+    return target_frequency_;
   }
 
   /*!
@@ -166,10 +218,12 @@ public:
 private:
   comm::URStream<RTDEPackage> stream_;
   std::vector<std::string> output_recipe_;
+  bool ignore_unavailable_outputs_;
   std::vector<std::string> input_recipe_;
   RTDEParser parser_;
-  comm::URProducer<RTDEPackage> prod_;
-  comm::Pipeline<RTDEPackage> pipeline_;
+  std::unique_ptr<comm::URProducer<RTDEPackage>> prod_;
+  comm::INotifier notifier_;
+  std::unique_ptr<comm::Pipeline<RTDEPackage>> pipeline_;
   RTDEWriter writer_;
 
   VersionInformation urcontrol_version_;
@@ -177,15 +231,48 @@ private:
   double max_frequency_;
   double target_frequency_;
 
+  ClientState client_state_;
+
   constexpr static const double CB3_MAX_FREQUENCY = 125.0;
   constexpr static const double URE_MAX_FREQUENCY = 500.0;
 
-  std::vector<std::string> readRecipe(const std::string& recipe_file);
+  // Reads output or input recipe from a file
+  std::vector<std::string> readRecipe(const std::string& recipe_file) const;
 
+  // Helper function to ensure that timestamp is present in the output recipe. The timestamp is needed to ensure that
+  // the robot is booted.
+  std::vector<std::string> ensureTimestampIsPresent(const std::vector<std::string>& output_recipe) const;
+
+  void setupCommunication(const size_t max_num_tries = 0,
+                          const std::chrono::milliseconds reconnection_time = std::chrono::seconds(10));
   bool negotiateProtocolVersion(const uint16_t protocol_version);
   void queryURControlVersion();
   void setupOutputs(const uint16_t protocol_version);
   void setupInputs();
+  void disconnect();
+
+  /*!
+   * \brief Updates the output recipe to the given one and recreates all the objects which depend on it.
+   * It should only be called while setting up the communication.
+   *
+   * \param new_recipe the new output recipe to use
+   */
+  void resetOutputRecipe(const std::vector<std::string> new_recipe);
+
+  /*!
+   * \brief Checks whether the robot is booted, this is done by looking at the timestamp from the robot controller, this
+   * will show the time in seconds since the controller was started. If the timestamp is below 40, we will read from
+   * the stream for approximately 1 second to ensure that the RTDE interface is up and running. This will ensure that we
+   * don't finalize setting up communication, before the controller is up and running. Else we could end up connecting
+   * to the RTDE interface, before a restart occurs during robot boot which would then destroy the connection
+   * established.
+   *
+   * \returns true if the robot is booted, false otherwise which will essentially trigger a reconnection.
+   */
+  bool isRobotBooted();
+  bool sendStart();
+  bool sendPause();
+
   /*!
    * \brief Splits a variable_types string as reported from the robot into single variable type
    * strings
